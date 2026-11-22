@@ -9,7 +9,13 @@ cmake -S phyloSMC -B phyloSMC/build/release -DCMAKE_BUILD_TYPE=Release
 cmake --build phyloSMC/build/release --parallel
 ctest --test-dir phyloSMC/build/release --output-on-failure
 ```
-A C17 compiler and CMake 3.16 or later are required. Nothing is downloaded during configuration. Add `-DBUILD_SHARED_LIBS=ON` to build shared libraries for CFFI or ctypes. During joint development, `-DPHYLOSMC_CURUPIXA_SOURCE=/path/to/curupixa` selects another checkout.
+A C17 compiler and CMake 3.16 or later are required. Add `-DBUILD_SHARED_LIBS=ON` to build shared libraries for CFFI or ctypes. 
+An example below, if you already have `curupixa` in another directory and wants to install the binaries in your `local`:
+```sh
+make -S . -B build/local -DCMAKE_INSTALL_PREFIX="$HOME/local" -DPHYLOSMC_CURUPIXA_SOURCE="$HOME/Academic/software/curupixa"
+cmake --build build/local --parallel ## builds inside `build/local` (using the settings above, inside `build/local`) 
+cmake --install build/local          ## installs the binaries in `$HOME/local/bin` and the library in `$HOME/local/lib`
+```
 ## Run
 ```sh
 build/release/phyloSMC alignment.fasta --particles 512 --moves 16 --seed 42
