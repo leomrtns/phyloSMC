@@ -1,0 +1,3 @@
+[submodule "external/curupixa"]
+	path = external/curupixa
+	url = git@github.com:leomrtns/curupixa.git
