@@ -1,5 +1,5 @@
 /* Copyright (C) 2026 Leonardo de Oliveira Martins
-   SPDX-License-Identifier: GPL-3.0-or-later */
+   SPDX-License-Identifier: MIT */
 #include "smc_internal.h"
 #include <particle_weights.h>
 #include <topology_randomise.h>
@@ -10,9 +10,13 @@
 void
 psmc_options_init (psmc_options *options)
 {
-  if (options)
-    *options = (psmc_options){
-      256, 8, 1000, .8, .5, .5, .05, 10, false, {CRPX_CLOCK_STRICT, 1, .3}, {CRPX_TREE_PRIOR_COALESCENT, 1, 0, 10, 1}};
+  if (options) {
+    *options = (psmc_options){.particles=256, .mcmc_steps=8, .max_stages=1000,
+      .conditional_ess=.8, .resample_ess=.5, .proposal_width=.5, .independence_probability=.05,
+      .branch_prior_rate=10, .clock={CRPX_CLOCK_STRICT, 1, .3},
+      .tree_prior={CRPX_TREE_PRIOR_COALESCENT, 1, 0, 10, 1}, .workers=1,
+      .priors={{10,1,.3,1,1,.5}, {1,1,1,1,1,1}, 1,1,2,1}};
+  }
 }
 
 void
@@ -24,6 +28,8 @@ psmc_result_free (psmc_result *result)
       psmc_private_free_particle (result->particles + i);
   free (result->particles);
   free (result->weights);
+  free (result->ancestor_ids);
+  free ((void *)result->options.root_side);
   crpx_character_data_free ((crpx_character_data *) result->data);
   free (result);
 }
@@ -48,10 +54,8 @@ psmc_anneal (const crpx_character_data *data, const crpx_substitution_model *mod
     status = CRPX_ERROR_ALLOCATION;
     goto done;
   }
-  for (size_t i = 0; i < count; i++) {
-    status = psmc_private_draw_prior (&context, result->particles + i);
-    if (status != CRPX_OK) goto done;
-  }
+  status = psmc_private_execute (&context, result, true);
+  if (status != CRPX_OK) goto done;
   while (result->beta < 1 && result->stages < options->max_stages) {
     for (size_t i = 0; i < count; i++)
       scores[i] = result->particles[i].log_likelihood;
@@ -84,8 +88,8 @@ done:
 }
 
 crpx_status
-psmc_online (const psmc_result *previous, const crpx_character_data *data, crpx_uniform_function uniform, void *state,
-             psmc_result **out)
+psmc_online_split (const psmc_result *previous, const crpx_character_data *data, const bool *root_side,
+                   crpx_uniform_function uniform, void *state, psmc_result **out)
 { /* A dimension-changing importance proposal, followed by full-posterior MH rejuvenation. */
   if (!out) return CRPX_ERROR_INVALID_ARGUMENT;
   *out = NULL;
@@ -94,24 +98,44 @@ psmc_online (const psmc_result *previous, const crpx_character_data *data, crpx_
   psmc_evaluation context = {0};
   psmc_result *result = NULL;
   double *logs = NULL;
-  status = psmc_private_prepare (&context, data, previous->model, &previous->options, uniform, state);
+  psmc_options extended = previous->options;
+  if (psmc_private_root_mode (&extended) != PSMC_ROOT_FIXED && root_side) return CRPX_ERROR_INVALID_ARGUMENT;
+  if (psmc_private_root_mode (&extended) == PSMC_ROOT_FIXED) {
+    if (!root_side) return CRPX_ERROR_INVALID_ARGUMENT;
+    size_t n = crpx_character_data_taxa (previous->data);
+    for (size_t i = 0; i < n; i++) if (root_side[i] != previous->options.root_side[i]) return CRPX_ERROR_INVALID_ARGUMENT;
+    extended.root_side = root_side;
+  }
+  status = psmc_private_prepare (&context, data, previous->model, &extended, uniform, state);
   if (status != CRPX_OK) goto done;
   status = psmc_private_result_new (&context, &result);
   if (status != CRPX_OK) goto done;
   result->beta = 1;
   result->stages = previous->stages + 1;
+  result->surviving_ancestors = previous->surviving_ancestors;
+  memcpy (result->ancestor_ids, previous->ancestor_ids, result->count * sizeof (*result->ancestor_ids));
   logs = malloc (result->count * sizeof (*logs));
   if (!logs) {
     status = CRPX_ERROR_ALLOCATION;
     goto done;
   }
-  double rate = result->options.branch_prior_rate;
+  bool unrooted = psmc_private_root_mode (&result->options) == PSMC_UNROOTED;
   const char *label = crpx_character_data_name (data, crpx_character_data_taxa (data) - 1);
   for (size_t i = 0; i < result->count; i++) {
     const psmc_particle *old = previous->particles + i;
     size_t nodes = crpx_tree_node_count (old->tree), edge;
-    double u, fraction, pendant, stem = 0, log_proposal = -log ((double) nodes);
-    status = psmc_private_index_draw (&context, nodes, &edge);
+    double rate = old->parameters.branch_rate;
+    size_t positions = unrooted ? nodes - 2 : nodes;
+    double u, fraction, pendant, stem = 0, log_proposal = -log ((double)positions);
+    status = psmc_private_index_draw (&context, positions, &edge);
+    if (unrooted && status == CRPX_OK) {
+      size_t rank = edge;
+      crpx_node_id anchor = psmc_private_anchor (&context, old->tree);
+      for (edge = 0; edge < nodes; edge++) if (edge != crpx_tree_root (old->tree) && edge != anchor) {
+        if (!rank) break;
+        rank--;
+      }
+    }
     if (status == CRPX_OK) status = psmc_private_draw (&context, &fraction);
     if (status == CRPX_OK) status = psmc_private_draw (&context, &u);
     if (status != CRPX_OK) goto done;
@@ -133,11 +157,12 @@ psmc_online (const psmc_result *previous, const crpx_character_data *data, crpx_
       log_proposal -= log (length);
     }
     psmc_particle *particle = result->particles + i;
+    particle->parameters = old->parameters;
     status = crpx_tree_insert_tip (old->tree, (crpx_node_id) edge, fraction, pendant, stem, label, &particle->tree);
     if (status == CRPX_OK) status = psmc_private_evaluate (&context, particle);
     if (status != CRPX_OK) goto done;
-    logs[i] = log (previous->weights[i]) + particle->log_prior - old->log_prior - log_proposal +
-              particle->log_likelihood - old->log_likelihood;
+    logs[i] = previous->weights[i] == 0 ? -INFINITY : log (previous->weights[i]) +
+              particle->log_prior - old->log_prior - log_proposal + particle->log_likelihood - old->log_likelihood;
   }
   double increment;
   status = crpx_particle_normalise (logs, result->count, result->weights, &increment, &result->ess);
@@ -179,4 +204,11 @@ psmc_substitution_tree (const psmc_result *result, size_t particle, crpx_tree **
     *out = NULL;
   }
   return status;
+}
+
+crpx_status
+psmc_online (const psmc_result *previous, const crpx_character_data *data, crpx_uniform_function uniform,
+             void *state, psmc_result **out)
+{
+  return psmc_online_split (previous, data, NULL, uniform, state, out);
 }

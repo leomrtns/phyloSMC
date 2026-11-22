@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT */
 #include "phylosmc.h"
 #include <global/random_number.h>
 #include <assert.h>
@@ -29,6 +29,7 @@ main (void)
   OK (crpx_substitution_model_poisson (2, &model));
   psmc_options options;
   psmc_options_init (&options);
+  options.root_mode = PSMC_ROOT_MOVABLE;
   options.particles = 3000;
   options.mcmc_steps = 3;
   options.independence_probability = .15;

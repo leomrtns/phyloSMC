@@ -1,5 +1,5 @@
 /* Copyright (C) 2026 Leonardo de Oliveira Martins
-   SPDX-License-Identifier: GPL-3.0-or-later */
+   SPDX-License-Identifier: MIT */
 #include "smc_internal.h"
 #include <particle_weights.h>
 #include <topology_randomise.h>
@@ -8,7 +8,7 @@
 #include <string.h>
 static crpx_status local_proposal (psmc_evaluation *context, psmc_particle *proposal, double *reverse_forward,
                                    bool *valid);
-static bool eligible_node (const crpx_tree *tree, crpx_node_id node, unsigned kind, bool clock);
+static bool eligible_node (const crpx_tree *tree, crpx_node_id node, unsigned kind, const psmc_evaluation *context);
 static crpx_status set_times (psmc_particle *particle);
 
 crpx_status
@@ -16,8 +16,9 @@ psmc_private_resample (psmc_evaluation *context, psmc_result *result)
 {
   size_t *indices = malloc (result->count * sizeof (*indices));
   psmc_particle *copies = calloc (result->count, sizeof (*copies));
+  size_t *ancestors = malloc (result->count * sizeof (*ancestors));
   crpx_status status = CRPX_OK;
-  if (!indices || !copies) {
+  if (!ancestors || !indices || !copies) {
     status = CRPX_ERROR_ALLOCATION;
     goto done;
   }
@@ -26,6 +27,12 @@ psmc_private_resample (psmc_evaluation *context, psmc_result *result)
   for (size_t i = 0; i < result->count && status == CRPX_OK; i++)
     status = psmc_private_copy_particle (result->particles + indices[i], copies + i);
   if (status == CRPX_OK) {
+    for (size_t i = 0; i < result->count; i++) ancestors[i] = result->ancestor_ids[indices[i]];
+    memcpy (result->ancestor_ids, ancestors, result->count * sizeof (*ancestors));
+    result->surviving_ancestors = 0;
+    memset (indices, 0, result->count * sizeof (*indices));
+    for (size_t i = 0; i < result->count; i++)
+      if (!indices[ancestors[i]]++) result->surviving_ancestors++;
     for (size_t i = 0; i < result->count; i++) {
       psmc_private_free_particle (result->particles + i);
       result->weights[i] = 1.0 / result->count;
@@ -42,13 +49,20 @@ done:
     free (copies);
   }
   free (indices);
+  free (ancestors);
   return status;
 }
 
 crpx_status
 psmc_private_rejuvenate (psmc_evaluation *context, psmc_result *result)
+{
+  return psmc_private_execute (context, result, false);
+}
+
+crpx_status
+psmc_private_rejuvenate_one (psmc_evaluation *context, psmc_result *result, size_t i)
 { /* Reweighting selects the target; these MH moves restore diversity at that target. */
-  for (size_t i = 0; i < result->count; i++)
+  if (result->weights[i] == 0) return CRPX_OK;
     for (size_t step = 0; step < result->options.mcmc_steps; step++) {
       psmc_particle proposal = {0}, *current = result->particles + i;
       double u, reverse_forward = 0;
@@ -100,11 +114,22 @@ local_proposal (psmc_evaluation *context, psmc_particle *proposal, double *rever
   double u;
   crpx_status status = psmc_private_draw (context, &u);
   if (status != CRPX_OK) return status;
+  if ((options->infer || options->substitution != PSMC_MODEL_FIXED) && u < .25) {
+    status = psmc_private_parameter_proposal (context, proposal, reverse_forward, valid);
+    if (status == CRPX_OK && *valid && options->use_clock) {
+      if (options->clock.kind == CRPX_CLOCK_STRICT)
+        for (size_t i = 0; i < context->nodes; i++) proposal->rates[i] = proposal->parameters.clock_mean;
+      proposal->rates[crpx_tree_root (proposal->tree)] = proposal->parameters.clock_mean;
+    }
+    return status;
+  }
+  status = psmc_private_draw (context, &u);
+  if (status != CRPX_OK) return status;
   unsigned kind = (unsigned) (u * (options->use_clock ? 3 : 2));
   if (options->use_clock && options->clock.kind == CRPX_CLOCK_STRICT && kind == 2) kind = 1;
   size_t eligible = 0, selected;
   for (size_t node = 0; node < context->nodes; node++)
-    eligible += eligible_node (proposal->tree, (crpx_node_id) node, kind, options->use_clock);
+    eligible += eligible_node (proposal->tree, (crpx_node_id) node, kind, context);
   if (!eligible) {
     *valid = false;
     return CRPX_OK;
@@ -113,7 +138,7 @@ local_proposal (psmc_evaluation *context, psmc_particle *proposal, double *rever
   if (status != CRPX_OK) return status;
   crpx_node_id node = 0;
   for (; node < context->nodes; node++)
-    if (eligible_node (proposal->tree, node, kind, options->use_clock)) {
+    if (eligible_node (proposal->tree, node, kind, context)) {
       if (selected == 0) break;
       selected--;
     }
@@ -152,8 +177,14 @@ local_proposal (psmc_evaluation *context, psmc_particle *proposal, double *rever
   return status;
 }
 static bool
-eligible_node (const crpx_tree *tree, crpx_node_id node, unsigned kind, bool clock)
+eligible_node (const crpx_tree *tree, crpx_node_id node, unsigned kind, const psmc_evaluation *context)
 {
+  bool clock = context->options->use_clock;
+  psmc_root_mode mode = psmc_private_root_mode (context->options);
+  if (mode == PSMC_UNROOTED && crpx_tree_first_child (tree, node) == CRPX_NODE_NONE &&
+      !strcmp (crpx_tree_label (tree, node), crpx_character_data_name (context->data, 0))) return false;
+  if (kind == 0 && (mode == PSMC_UNROOTED || mode == PSMC_ROOT_FIXED) &&
+      crpx_tree_parent (tree, node) == crpx_tree_root (tree)) return false;
   bool internal = crpx_tree_first_child (tree, node) != CRPX_NODE_NONE;
   if (kind == 0) return internal && node != crpx_tree_root (tree);
   if (kind == 1 && clock) return internal;
